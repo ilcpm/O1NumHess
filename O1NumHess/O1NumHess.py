@@ -29,33 +29,49 @@ class O1NumHess:
 
         self.grad_func = grad_func
         self.kwargs = kwargs_for_grad_func
-        self.total_cores = os.cpu_count() # total num of cpu core
+        # self.total_cores = os.cpu_count() # total num of cpu core
 
-    def _parallel_execute(self, x_list: List[np.ndarray], core: int = 1) -> List[np.ndarray]:
+    def _parallel_execute(self, x_list: List[np.ndarray], core: int = 1, total_cores: Union[int, None] = None) -> List[np.ndarray]: # type: ignore
         """
         用法：给定若干向量x构成的列表x_list，调用梯度函数g并行对每个x进行计算，返回梯度构成的列表
         """
+        # ==================== check the cores
+        # ensure total_cores is legal
+        cpu_count = os.cpu_count()
+        if not isinstance(cpu_count, int):
+            assert isinstance(total_cores, int), f"Unable to obtain the maximum number of cores for the current computer, and total_cores has not been set"
+            warnings.warn(f"Unable to obtain the maximum number of cores for the current computer, make sure total_cores ({total_cores}) is legal.", RuntimeWarning)
+        else:
+            if total_cores is None:
+                warnings.warn(f"total_cores ({total_cores}) is not set or unknown, os.cpu_count() ({os.cpu_count()}) is used.", RuntimeWarning)
+                total_cores:int = cpu_count
+            elif not isinstance(total_cores, int):
+                raise TypeError(f"total_cores must be int, {type(total_cores)} is given.")
+            else: # total_cores is int
+                if not total_cores <= cpu_count:
+                    raise ValueError(f"total_cores ({total_cores}) must <= os.cpu_count() ({cpu_count})")
 
-        # 确保用户给定的核心数量合法
+        # ensure core is legal
         if not isinstance(core, int):
             raise TypeError(f"core must be int, {type(core)} is given.")
         elif core < 0:
             raise ValueError(f"The number of cores specified by the user: {core} must > 0!")
-        elif core > self.total_cores:
-            raise ValueError(f"The number of cores specified by the user: {core} exceeds the total number of available cores: {self.total_cores}.")
-        # 如果用户给定的核心数量=0或不能整除总核心数量，警告
+        elif core > total_cores:
+            raise ValueError(f"The number of cores specified by the user: {core} exceeds the total number of available cores: {total_cores}.")
+        # If the number of cores specified by the user equals 0 or cannot divide exactly the total number of cores, warning
         if core == 0:
-            warnings.warn(f"The number of cores specified by the user: {core} is 0, default value 1 will be use.", UserWarning)
+            warnings.warn(f"The number of cores specified by the user: {core} is 0, default value 1 will be use.", RuntimeWarning)
             core = 1
-        elif self.total_cores % core != 0:
-            warnings.warn(f"The number of cores specified by the user: {core} is not a divisor of the total number of cores: {self.total_cores}, may lead to performance issues.", UserWarning)
+        elif total_cores % core != 0:
+            warnings.warn(f"The number of cores specified by the user: {core} is not a divisor of the total number of cores: {total_cores}, may lead to performance issues.", RuntimeWarning)
 
+        # ==================== calculate
         n = len(x_list)  # 总任务数
-        max_concurrent = self.total_cores // core  # 最大并行任务数量
+        max_concurrent = total_cores // core  # 最大并行任务数量
         main_batch = n // max_concurrent * max_concurrent  # 前面的主要批次的任务数（阶段1）
         tail_batch = n % max_concurrent  # 尾部剩余批次的任务数（阶段2）
 
-        result = [None] * n
+        result:list[np.ndarray] = [None] * n # type: ignore
 
         # 阶段1
         if main_batch > 0:
@@ -65,7 +81,7 @@ class O1NumHess:
                         self.grad_func,
                         x_list[i],  # x
                         i,          # index
-                        core,       #core
+                        core,       # core
                         **self.kwargs,
                     ): i
                     for i in range(main_batch)
@@ -77,14 +93,14 @@ class O1NumHess:
         # 阶段2
         if tail_batch > 0:
             # 每个任务固定分得 total_cores // tail_batch 个核心，前面 total_cores % tail_batch 个任务多分1个核心
-            core_list = [(self.total_cores // tail_batch) + 1 if i < (self.total_cores % tail_batch) else (self.total_cores // tail_batch) for i in range(tail_batch)]
+            core_list = [(total_cores // tail_batch) + 1 if i < (total_cores % tail_batch) else (total_cores // tail_batch) for i in range(tail_batch)]
             with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
                 future_to_idx = {
                     executor.submit(
                         self.grad_func,
                         x_list[i + main_batch], # x
                         i + main_batch,         # index
-                        core_list[i],           #core
+                        core_list[i],           # core
                         **self.kwargs,
                     ): i + main_batch
                     for i in range(tail_batch)
@@ -95,7 +111,7 @@ class O1NumHess:
 
         return result
 
-    def singleSide(self, core: int = 0, delta: float = 1e-6) -> np.ndarray:
+    def singleSide(self, delta: float = 1e-6, core: int = 0, total_cores: Union[int, None] = None) -> np.ndarray:
         r"""
         $$H_{ij}\approx\frac{g_{j}(x_{1},...,x_{i}+\Delta x,...,x_{n})-g_{j}(x_{1},...,x_{i},...,x_{n})}{\Delta x}$$
 
@@ -109,15 +125,15 @@ class O1NumHess:
         #  (x1   , x2+Δx, ..., xi   , ..., xn   ),
         #  (x1   , x2   , ..., xi+Δx, ..., xn   ),
         #  (x1   , x2   , ..., xi   , ..., xn+Δx)]
-        grad_and_grad_with_delta = self._parallel_execute(x_and_x_with_delta, core=core)
+        grad_and_grad_with_delta = self._parallel_execute(x_and_x_with_delta, core=core, total_cores=total_cores)
         # each line of x_and_x_with_delta will become grad here
-        hessian = (np.vstack(grad_and_grad_with_delta[1:]) - grad_and_grad_with_delta[0]) / delta
+        hessian:np.ndarray = (np.vstack(grad_and_grad_with_delta[1:]) - grad_and_grad_with_delta[0]) / delta # type: ignore
         # each line of np.vstack(grad_and_grad_with_delta[1:]) denotes g(..., x_i-Δx, ...)
         # each line minus grad_and_grad_with_delta[0] denotes g(..., x_i+Δx, ...) - g(..., x_i, ...)
 
         return hessian
 
-    def doubleSide(self, core: int = 0, delta: float = 1e-6) -> np.ndarray:
+    def doubleSide(self, delta: float = 1e-6, core: int = 0, total_cores: Union[int, None] = None) -> np.ndarray:
         r"""
         $$H_{ij}\approx\frac{g_j(x_1,...,x_i+\Delta x,...,x_n)-g_j(x_1,...,x_i-\Delta x,...,x_n)}{2\Delta x}$$
 
@@ -125,8 +141,8 @@ class O1NumHess:
         """
         n = len(self.x)
         all_x_with_delta = [*(self.x + delta * np.eye(n)), *(self.x - delta * np.eye(n))]
-        all_grad_with_delta = self._parallel_execute(all_x_with_delta, core=core)
-        hessian = (np.vstack(all_grad_with_delta[:n]) - np.vstack(all_grad_with_delta[n:])) / (2 * delta)
+        all_grad_with_delta = self._parallel_execute(all_x_with_delta, core=core, total_cores=total_cores)
+        hessian = (np.vstack(all_grad_with_delta[:n]) - np.vstack(all_grad_with_delta[n:])) / (2 * delta) # type: ignore
         # np.vstack(all_grad_with_delta[:n]) denotes g(..., x_i+Δx, ...)
         # np.vstack(all_grad_with_delta[n:]) denotes g(..., x_i-Δx, ...)
         # view the comments in singleSide() for more information
@@ -148,7 +164,7 @@ class O1NumHess:
             delta_forward[i] += delta
             forward = self.grad_func(delta_forward, 0, **self.kwargs)
             delta_g.append(forward - org)
-        hessian = np.vstack(delta_g) / delta
+        hessian = np.vstack(delta_g) / delta # type: ignore
 
         return hessian
 
@@ -167,6 +183,6 @@ class O1NumHess:
             forward = self.grad_func(delta_forward, 0, **self.kwargs)
             backward = self.grad_func(delta_backward, 0, **self.kwargs)
             delta_g.append(forward - backward)
-        hessian = np.vstack(delta_g) / (2 * delta)
+        hessian = np.vstack(delta_g) / (2 * delta) # type: ignore
 
         return hessian
