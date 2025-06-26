@@ -48,8 +48,8 @@ class O1NumHess:
             elif not isinstance(total_cores, int):
                 raise TypeError(f"total_cores must be int, {type(total_cores)} is given.")
             else: # total_cores is int
-                if not total_cores <= cpu_count:
-                    raise ValueError(f"total_cores ({total_cores}) must <= os.cpu_count() ({cpu_count})")
+                if not 1 <= total_cores <= cpu_count:
+                    raise ValueError(f"total_cores ({total_cores}) must <= os.cpu_count() ({cpu_count}) and= > 1")
 
         # ensure core is legal
         if not isinstance(core, int):

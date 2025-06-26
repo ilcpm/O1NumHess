@@ -14,7 +14,7 @@ def f(x: np.ndarray) -> float:
     n = len(x)
     a = np.arange(1, n + 1)  # a_i = i
     b = np.arange(n, 0, -1)  # b_i = n - i
-    res = np.sum(a * x) + np.sin(np.sum(b * x))
+    res = np.sum(a * x) + np.sin(np.sum(b * x)) # type: ignore
 
     return res
 
@@ -28,14 +28,14 @@ def grad_f(x: np.ndarray, index: int, core=0, **kwargs) -> np.ndarray:
     n = len(x)
     a = np.arange(1, n + 1)  # a_i = i
     b = np.arange(n, 0, -1)  # b_i = n - i
-    res = a + b * np.cos(np.dot(b, x))
+    res = a + b * np.cos(np.dot(b, x)) # type: ignore
 
     # use sleep to imitate parallel running
     if core > 0:
         t = np.random.rand()
-        print(f"grad func begin to sleep {t} seconds, {kwargs}")
+        print(f"grad func {index} begin to sleep {t} seconds, {kwargs}")
         sleep(t)
-        print(f"grad func wake up from sleep {t} seconds, {kwargs}")
+        print(f"grad func {index} wake up from sleep {t} seconds, {kwargs}")
 
     return res
 
@@ -98,6 +98,10 @@ class TestO1NumHess(unittest.TestCase):
             self.o1nh.doubleSide(total_cores=None)
         with self.assertRaises(ValueError):
             self.o1nh.doubleSide(total_cores=999)
+        with self.assertRaises(ValueError):
+            self.o1nh.doubleSide(total_cores=0)
+        with self.assertRaises(ValueError):
+            self.o1nh.doubleSide(total_cores=-1)
         with self.assertRaises(TypeError):
             self.o1nh.doubleSide(total_cores=1.2) # type: ignore
 
