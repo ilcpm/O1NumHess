@@ -39,7 +39,9 @@ class O1NumHess:
         # ensure total_cores is legal
         cpu_count = os.cpu_count()
         if not isinstance(cpu_count, int):
-            assert isinstance(total_cores, int), f"Unable to obtain the maximum number of cores for the current computer, and total_cores has not been set"
+            assert isinstance(total_cores, int), f"Unable to obtain the maximum number of cores for the current computer, and total_cores has not been correctly set"
+            if total_cores <= 0:
+                raise ValueError(f"total_cores must > 0, {total_cores} is given")
             warnings.warn(f"Unable to obtain the maximum number of cores for the current computer, make sure total_cores ({total_cores}) is legal.", RuntimeWarning)
         else:
             if total_cores is None:
