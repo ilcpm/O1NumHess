@@ -189,22 +189,25 @@ class O1NumHess:
         """
         from scipy.sparse.csgraph import connected_components
         N = self.x.size
-        nblist = [[]]*N
+        nblist = []
 
         for i in range(N):
-            nblist[i] = list(distmat[i,:]<dmax)
+            nblist.append([])
+            for j in range(N):
+                if distmat[i,j]<dmax:
+                    nblist[i].append(j)
 
         ncomp, labels = connected_components(distmat<dmax)
         maxdist = np.max(distmat)
         # constituent atoms of each connected component
         comp_atoms = [[]]*ncomp
         for i in range(ncomp):
-            comp_atoms[i] = np.nonzero(labels==i)
+            comp_atoms[i] = np.nonzero(labels==i)[0].tolist()
         # for each pair of connected components, connect the closest pair(s) of atoms
         # between this pair of connected components
-        d = maxdist
         for i in range(ncomp):
             for j in range(i+1,ncomp):
+                d = maxdist
                 iibest = []
                 jjbest = []
                 for ii in comp_atoms[i]:
@@ -214,10 +217,12 @@ class O1NumHess:
                             iibest = [ii]
                             jjbest = [jj]
                         elif distmat[ii,jj] < d + eps: # account for distance degeneracy
-                            iibest.append(ii)
-                            jjbest.append(jj)
-                nblist[iibest] += jjbest
-                nblist[jjbest] += iibest
+                            if not ii in iibest: iibest.append(ii)
+                            if not jj in jjbest: jjbest.append(jj)
+                for ii in iibest:
+                    for jj in jjbest:
+                        if not jj in nblist[ii]: nblist[ii].append(jj)
+                        if not ii in nblist[jj]: nblist[jj].append(ii)
         return nblist
 
     def _gen_displdir(self,
@@ -255,7 +260,7 @@ class O1NumHess:
             for j in range(N):
                 # If the displacement directions already span the whole space spanned by
                 # the indices in the local neighborhood of index i, skip
-                nnb = np.sum(nblist[j])
+                nnb = len(nblist[j])
                 if nnb <= i+Ndispl0:
                     continue
                 submat = H0[np.ix_(nblist[j],nblist[j])]
