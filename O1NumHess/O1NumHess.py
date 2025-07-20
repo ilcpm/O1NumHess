@@ -179,7 +179,7 @@ class O1NumHess:
         Neighbor list based on a distance matrix.
         (1) indices whose distances are < dmax are neighbors
         (2) If the above criterion gives a disconnected graph, add just enough linkages
-            to make the graph connected
+            to make the graph connected, by following the minimum spanning tree of the graph
         Input:  x (the vector of variables)
                 distmat (the distance matrix)
                 dmax (distance criterion)
@@ -187,7 +187,7 @@ class O1NumHess:
         Output: nblist (neighbor list, a list of differently sized lists;
                 nblist[i] contains the list of indices that are neighbors of index i)
         """
-        from scipy.sparse.csgraph import connected_components
+        from scipy.sparse.csgraph import connected_components, minimum_spanning_tree
         N = self.x.size
         nblist = []
 
@@ -199,30 +199,44 @@ class O1NumHess:
 
         ncomp, labels = connected_components(distmat<dmax)
         maxdist = np.max(distmat)
-        # constituent atoms of each connected component
-        comp_atoms = [[]]*ncomp
+        # constituent indices of each connected component
+        comp_ind = [[]]*ncomp
         for i in range(ncomp):
-            comp_atoms[i] = np.nonzero(labels==i)[0].tolist()
-        # for each pair of connected components, connect the closest pair(s) of atoms
-        # between this pair of connected components
+            comp_ind[i] = np.nonzero(labels==i)[0].tolist()
+
+        # for each pair of connected components, connect the closest pair(s) of indices
+        # between this pair of connected components. Also record the closest contact distance
+        distmat_comp = np.zeros([ncomp,ncomp])
+        # iibest[i,j]: the list of indices of component i that are closest to component j
+        iibest = {}
         for i in range(ncomp):
             for j in range(i+1,ncomp):
                 d = maxdist
-                iibest = []
-                jjbest = []
-                for ii in comp_atoms[i]:
-                    for jj in comp_atoms[j]:
+                iibest[i,j] = []
+                for ii in comp_ind[i]:
+                    for jj in comp_ind[j]:
                         if distmat[ii,jj] < d - eps:
                             d = distmat[ii,jj]
-                            iibest = [ii]
-                            jjbest = [jj]
+                            iibest[i,j] = [ii]
+                            iibest[j,i] = [jj]
                         elif distmat[ii,jj] < d + eps: # account for distance degeneracy
-                            if not ii in iibest: iibest.append(ii)
-                            if not jj in jjbest: jjbest.append(jj)
-                for ii in iibest:
-                    for jj in jjbest:
-                        if not jj in nblist[ii]: nblist[ii].append(jj)
-                        if not ii in nblist[jj]: nblist[jj].append(ii)
+                            if not ii in iibest[i,j]: iibest[i,j].append(ii)
+                            if not jj in iibest[j,i]: iibest[j,i].append(jj)
+                distmat_comp[i,j] = d
+                distmat_comp[j,i] = d
+
+        # generate minimum spanning tree
+        tree = minimum_spanning_tree(distmat_comp).toarray()
+
+        # connect the closest index pairs
+        for i in range(ncomp):
+            for j in range(i+1,ncomp):
+                if tree[i,j] >= 1e-8: # components i and j are connected in the tree
+                    for ii in iibest[i,j]:
+                        for jj in iibest[j,i]:
+                            if not jj in nblist[ii]: nblist[ii].append(jj)
+                            if not ii in nblist[jj]: nblist[jj].append(ii)
+                    
         return nblist
 
     def _gen_displdir(self,
