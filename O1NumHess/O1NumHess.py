@@ -236,7 +236,7 @@ class O1NumHess:
                         for jj in iibest[j,i]:
                             if not jj in nblist[ii]: nblist[ii].append(jj)
                             if not ii in nblist[jj]: nblist[jj].append(ii)
-                    
+
         return nblist
 
     def _gen_displdir(self,
@@ -331,7 +331,7 @@ class O1NumHess:
 
         return displdir
 
-    def _vech0(H: np.ndarray, mask: np.ndarray) -> np.array:
+    def _vech0(self, H: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
         Compress the elements of H into a vector, considering:
         (1) Only those element where mask==True are kept
@@ -340,7 +340,7 @@ class O1NumHess:
         H = (H + H.T)/2.
         return H[np.tril(mask)]
 
-    def _inv_vech0(v: np.array, mask: np.ndarray) -> np.ndarray:
+    def _inv_vech0(self, v: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
         The inverse function of _vech0. Always returns a symmetric matrix.
         """
@@ -376,19 +376,19 @@ class O1NumHess:
             tstart = time.time()
 
         # Regularization term
-        W2 = self.lam * np.maximum(0.,distmat-dmax)**(2.*self.bet)
+        W2 = self.lam * np.maximum(0.,distmat-dmax)**(2.*self.bet) # type: ignore
 
         # Prepare the RHS vector. This also gives the dimension of the problem
         RHS = np.matmul(g,displdir.T)
         RHS = (RHS+RHS.T)/2.
-        mask = distmat<(dmax+self.ddmax)
-        RHSv = O1NumHess._vech0(RHS, mask)
+        mask: np.ndarray = distmat<(dmax+self.ddmax) # type: ignore
+        RHSv = self._vech0(RHS, mask)
         Ndim = RHSv.size
 
         # Define the MVP function as a LinearOperator
         from scipy.sparse.linalg import LinearOperator, gmres
-        f1 = lambda v: np.matmul(np.matmul(O1NumHess._inv_vech0(v, mask),displdir),displdir.T)
-        f = lambda v: O1NumHess._vech0(f1(v) + W2*O1NumHess._inv_vech0(v, mask), mask)
+        f1 = lambda v: np.matmul(np.matmul(self._inv_vech0(v, mask),displdir),displdir.T)
+        f = lambda v: self._vech0(f1(v) + W2*self._inv_vech0(v, mask), mask)
         A = LinearOperator((Ndim,Ndim), matvec=f)
 
         # Call GMRES
@@ -398,11 +398,11 @@ class O1NumHess:
             print('Warning: gmres returned with error code %d'%info)
 
         # Recover the desired Hessian (local part)
-        hnum = O1NumHess._inv_vech0(hnumv, mask)
+        hnum = self._inv_vech0(hnumv, mask)
         if self.verbosity > 2:
             tend = time.time()
             err = np.linalg.norm(g - np.matmul(hnum,displdir))
-            print('Successful termination of _genLocalHessian, time = %.2f sec'%(tend-tstart))
+            print('Successful termination of _genLocalHessian, time = %.2f sec'%(tend-tstart)) # type: ignore
             if self.verbosity > 5:
                 print('Local part of the Hessian:')
                 print(hnum)
@@ -454,8 +454,8 @@ class O1NumHess:
 
         if self.verbosity > 2:
             tend = time.time()
-            print('Successful termination of _genODLRHessian, time = %.2f sec'%(tend-tstart))
-            print('Error norm of the predicted gradient: %.2e'%err)
+            print('Successful termination of _genODLRHessian, time = %.2f sec'%(tend-tstart)) # type: ignore
+            print('Error norm of the predicted gradient: %.2e'%err) # type: ignore
 
         return hnum
 
@@ -467,9 +467,9 @@ class O1NumHess:
                   distmat: np.ndarray = np.zeros([0,0]),
                   H0: np.ndarray = np.zeros([0,0]),
                   displdir: np.ndarray = np.zeros([0,0]),
-                  g: np.array = np.zeros([0,0]),
+                  g: np.ndarray = np.zeros([0,0]),
                   g0: np.ndarray = np.zeros(0),
-                  doublesided: np.array = np.zeros(0, dtype=bool),
+                  doublesided: np.ndarray = np.zeros(0, dtype=bool),
                   gen_new_displdir: bool = True
                   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
