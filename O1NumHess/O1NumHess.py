@@ -46,9 +46,28 @@ class O1NumHess:
         # convergence parameters for the low-rank part
         self.maxiter_LR = 100
         self.thresh_LR = 1e-8
+        self.mingrad_LR = 1e-3
 
     def setVerbosity(self, verbosity: int):
         self.verbosity = verbosity
+
+    def setParams(self,
+                  lam: Union[float, None] = None,
+                  bet: Union[float, None] = None,
+                  ddmax: Union[float, None] = None,
+                  maxiter_LR: Union[int, None] = None,
+                  thresh_LR: Union[float, None] = None,
+                  mingrad_LR: Union[float, None] = None,
+                  ):
+        """
+        Set the less important parameters.
+        """
+        if lam != None: self.lam = lam
+        if bet != None: self.bet = bet
+        if ddmax != None: self.ddmax = ddmax
+        if maxiter_LR != None: self.maxiter_LR = maxiter_LR
+        if thresh_LR != None: self.thresh_LR = thresh_LR
+        if mingrad_LR != None: self.mingrad_LR = mingrad_LR
 
     def _parallel_execute(self, x_list: List[np.ndarray], core: int = 1, total_cores: Union[int, None] = None) -> List[np.ndarray]: # type: ignore
         """
@@ -331,7 +350,7 @@ class O1NumHess:
 
         return displdir
 
-    def _vech0(H: np.ndarray, mask: np.ndarray) -> np.array:
+    def _vech0(self, H: np.ndarray, mask: np.ndarray) -> np.array:
         """
         Compress the elements of H into a vector, considering:
         (1) Only those element where mask==True are kept
@@ -340,7 +359,7 @@ class O1NumHess:
         H = (H + H.T)/2.
         return H[np.tril(mask)]
 
-    def _inv_vech0(v: np.array, mask: np.ndarray) -> np.ndarray:
+    def _inv_vech0(self, v: np.array, mask: np.ndarray) -> np.ndarray:
         """
         The inverse function of _vech0. Always returns a symmetric matrix.
         """
@@ -382,13 +401,13 @@ class O1NumHess:
         RHS = np.matmul(g,displdir.T)
         RHS = (RHS+RHS.T)/2.
         mask = distmat<(dmax+self.ddmax)
-        RHSv = O1NumHess._vech0(RHS, mask)
+        RHSv = self._vech0(RHS, mask)
         Ndim = RHSv.size
 
         # Define the MVP function as a LinearOperator
         from scipy.sparse.linalg import LinearOperator, gmres
-        f1 = lambda v: np.matmul(np.matmul(O1NumHess._inv_vech0(v, mask),displdir),displdir.T)
-        f = lambda v: O1NumHess._vech0(f1(v) + W2*O1NumHess._inv_vech0(v, mask), mask)
+        f1 = lambda v: np.matmul(np.matmul(self._inv_vech0(v, mask),displdir),displdir.T)
+        f = lambda v: self._vech0(f1(v) + W2*self._inv_vech0(v, mask), mask)
         A = LinearOperator((Ndim,Ndim), matvec=f)
 
         # Call GMRES
@@ -398,17 +417,58 @@ class O1NumHess:
             print('Warning: gmres returned with error code %d'%info)
 
         # Recover the desired Hessian (local part)
-        hnum = O1NumHess._inv_vech0(hnumv, mask)
+        hnum = self._inv_vech0(hnumv, mask)
         if self.verbosity > 2:
             tend = time.time()
             err = np.linalg.norm(g - np.matmul(hnum,displdir))
             print('Successful termination of _genLocalHessian, time = %.2f sec'%(tend-tstart))
             if self.verbosity > 5:
                 print('Local part of the Hessian:')
-                print(hnum)
+                with np.printoptions(threshold=10000, edgeitems=50):
+                    print(hnum)
             print('Error norm of the predicted gradient: %.2e'%err)
 
         return hnum
+
+    def _LRLoop(self, g_in: np.ndarray, hnum: np.ndarray, d_in: np.ndarray):
+        """
+        Given gradients g, approximate Hessian hnum and the displacement directions
+        along which the gradients were calculated (displdir), correct hnum using a
+        symmetric, numerically low rank correction so that, if possible, g=hnum*displdir.
+        If this is not possible, a warning will be printed.
+        Note: low-frequency modes will receive larger weights
+        """
+        # Weight the displacement directions and gradients, so that small gradients
+        # (corresponding to low-frequency modes) receive larger weights
+        g = np.zeros(g_in.shape)
+        displdir = np.zeros(d_in.shape)
+        for i in range(g.shape[1]):
+            norm_gi = max(np.linalg.norm(g[:,i]), self.mingrad_LR)
+            g[:,i] = self.mingrad_LR/norm_gi*g_in[:,i]
+            displdir[:,i] = self.mingrad_LR/norm_gi*d_in[:,i]
+
+        dampfac = 1.0
+        err0 = np.inf
+        norm_g = np.linalg.norm(g)
+        for it in range(self.maxiter_LR):
+            resid = g - np.matmul(hnum,displdir)
+            err = np.linalg.norm(resid)
+            if err < self.thresh_LR:
+                break
+            elif abs(err-err0) < self.thresh_LR*err0:
+                print('The gradients cannot be exactly reproduced by a symmetric Hessian.')
+                break
+            elif err > err0 and err > norm_g: # iterations diverge
+                dampfac *= 0.5
+                if self.verbosity > 1:
+                    print('Warning: error too large, damping the correction by a factor of %.2e'%dampfac)
+            if self.verbosity > 4:
+                print('Iter %3d error %.2e'%(it,err))
+            hcorr = np.matmul(resid, displdir.T)
+            hcorr = (hcorr+hcorr.T)/2.
+            hnum += dampfac*hcorr
+            err0 = err
+        return hnum, err
 
     def _genODLRHessian(self,
                         distmat: np.ndarray,
@@ -430,27 +490,7 @@ class O1NumHess:
         hnum = self._genLocalHessian(distmat, displdir, g, dmax)
 
         # The low rank part
-        dampfac = 1.0
-        err0 = np.inf
-        for it in range(self.maxiter_LR):
-            resid = g - np.matmul(hnum,displdir)
-            err = np.linalg.norm(resid)
-            if err < self.thresh_LR:
-                break
-            elif abs(err-err0) < self.thresh_LR:
-                print('The gradients cannot be exactly reproduced by a symmetric Hessian.')
-                print('Exit _genODLRHessian')
-                break
-            elif err > 1.0: # iterations diverge
-                dampfac *= 0.5
-                if self.verbosity > 1:
-                    print('Warning: error too large, damping the correction by a factor of %.2e'%dampfac)
-            if self.verbosity > 4:
-                print('Iter %3d error %.2e'%(it,err))
-            hcorr = np.matmul(resid, displdir.T)
-            hcorr = (hcorr+hcorr.T)/2.
-            hnum += dampfac*hcorr
-            err0 = err
+        hnum, err = self._LRLoop(g, hnum, displdir)
 
         if self.verbosity > 2:
             tend = time.time()
@@ -523,14 +563,26 @@ class O1NumHess:
             # The calculation has index 2*N, to avoid clashing with other displacement directions
             g0 = self.grad_func(self.x,2*N,total_cores,**self.kwargs)
 
-        # Normalize the input displdir. if there is any
+        # Orthonormalize the input displdir. if there is any
+        Ndispl0 = displdir.shape[1]
         for i in range(displdir.shape[1]):
+            if i>=Ndispl0:
+                break
             n = np.linalg.norm(displdir[:,i])
             if n==0:
                 raise ZeroDivisionError('Displacement direction %d is a zero vector'%i)
             displdir[:,i] /= n
+            for j in range(i):
+                displdir[:,i] -= np.dot(displdir[:,i],displdir[:,j])*displdir[:,j]
+            n = np.linalg.norm(displdir[:,i])
+            if n==0: # displacement direction i is redundant
+                # move forward
+                # This will make displdir[:,-1] identical to displdir[:,-2]
+                displdir[:,i:-1] = displdir[:,i+1:]
+                Ndispl0 -= 1
+            else:
+                displdir[:,i] /= n
 
-        Ndispl0 = displdir.shape[1]
         if self.verbosity > 1:
             print("%d displacement directions given on input"%Ndispl0)
         if gen_new_displdir:
@@ -560,7 +612,8 @@ class O1NumHess:
         if gen_new_displdir:
             if self.verbosity > 5:
                 print("Displacement directions:")
-                print(displdir)
+                with np.printoptions(threshold=10000, edgeitems=50):
+                    print(displdir)
 
         # Prepare the displacement vectors
         # First, count the number of displacement vectors, considering:
@@ -571,13 +624,20 @@ class O1NumHess:
         if self.verbosity > 1:
             print("%d gradients will be calculated"%Ngrad)
 
+        # Make the largest absolute element of the displacements equal to delta.
+        # This gives numerically more stable results than making the norms of
+        # the displacements equal to delta
+        max_displdir = np.zeros(Ndispl-Ng)
+        for i in range(Ndispl-Ng):
+            max_displdir[i] = np.max(np.abs(displdir[:,i+Ng]))
+
         x_with_delta = np.zeros([Ngrad,N])
         for i in range(Ndispl-Ng):
-            x_with_delta[i,:] = self.x + delta*displdir[:,i+Ng]
+            x_with_delta[i,:] = self.x + delta/max_displdir[i]*displdir[:,i+Ng]
         j = Ndispl-Ng
         for i in range(Ndispl-Ng):
             if doublesided[i+Ng]:
-                x_with_delta[j,:] = self.x - delta*displdir[:,i+Ng]
+                x_with_delta[j,:] = self.x - delta/max_displdir[i]*displdir[:,i+Ng]
                 j += 1
 
         # Calculate the gradients
@@ -588,7 +648,8 @@ class O1NumHess:
             print("Gradient calculations finished")
             if self.verbosity > 5:
                 print("Raw gradients:")
-                print(grad_with_delta)
+                with np.printoptions(threshold=10000, edgeitems=50):
+                    print(grad_with_delta)
 
         # Divide the step length, taking special care of double-sided displacement directions
         gout = np.zeros([N,Ndispl])
@@ -596,13 +657,14 @@ class O1NumHess:
         j = Ndispl-Ng
         for i in range(Ng,Ndispl):
             if doublesided[i]:
-                gout[:,i] = (grad_with_delta[i-Ng]-grad_with_delta[j])/(2.*delta)
+                gout[:,i] = (grad_with_delta[i-Ng]-grad_with_delta[j])/(2.*delta)*max_displdir[i-Ng]
                 j += 1
             else:
-                gout[:,i] = (grad_with_delta[i-Ng]-g0)/delta
+                gout[:,i] = (grad_with_delta[i-Ng]-g0)/delta*max_displdir[i-Ng]
         if self.verbosity > 5:
             print("Gradient derivatives:")
-            print(gout)
+            with np.printoptions(threshold=10000, edgeitems=50):
+                print(gout)
 
         # Extract the Hessian - the essence of the O1NumHess algorithm!
         hessian = self._genODLRHessian(distmat, displdir, gout, dmax)
