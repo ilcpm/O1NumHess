@@ -1,14 +1,18 @@
-# from __future__ import annotations
 import numpy as np
 import scipy
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import os
+from pathlib import Path
 import warnings
 import time
+import json
+import pickle
+import shutil
+from datetime import datetime
 
-from typing import Any, Callable, List, Union, Dict, Sequence, Tuple
+from typing import Any, Callable, Final, List, Union, Dict, Sequence, Tuple
 
 
 class O1NumHess:
@@ -17,8 +21,10 @@ class O1NumHess:
         x: Union[np.ndarray, np.matrix, List[float]],
         # /, # `/` only available in python >= 3.8
         grad_func: Callable[..., np.ndarray],
+        verbosity:int = 0,
         **kwargs_for_grad_func, # TODO kwargs for func g can be specified both here and called
     ):
+        self.verbosity = verbosity
 
         # TODO assert grad_func is callable
 
@@ -30,11 +36,15 @@ class O1NumHess:
         if self.x.ndim == 2:
             self.x = self.x[0]
 
+        # for gradient function
         self.grad_func = grad_func
         self.kwargs = kwargs_for_grad_func
-        # self.total_cores = os.cpu_count() # total num of cpu core
 
-        self.verbosity = 0
+        # for calculate
+        self.task_cfg_json_name: Final = "task.json"
+        self.task_result_json_name: Final = "task_result.json"
+        self.task_config = {}
+        self.task_result = {}
 
         # regularization parameters for _genODLRHessian
         self.lam = 1e-2
@@ -50,7 +60,32 @@ class O1NumHess:
     def setVerbosity(self, verbosity: int):
         self.verbosity = verbosity
 
-    def _parallel_execute(self, x_list: List[np.ndarray], core: int = 1, total_cores: Union[int, None] = None) -> List[np.ndarray]: # type: ignore
+    @staticmethod
+    def _getTaskdir(task_name: str) -> Path:
+        return Path(f"O1NH_{task_name}")
+
+    @staticmethod
+    def _save2json(obj:Dict, path: Union[Path, str] = ".", filename: str = ""):
+        """save dict to json file, used to save config and result"""
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("filename invalid")
+        os.makedirs(path, exist_ok=True)
+
+        temp = Path(path) / (filename + ".tmp")
+        result = Path(path) / filename
+        temp.write_text(
+            json.dumps(obj, indent=4, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temp.rename(result)
+    def _parallel_execute(
+        self,
+        x_list: List[np.ndarray],
+        core: int = 1,
+        total_cores: Union[int, None] = None, # type: ignore
+        task_name: str = "hessian",
+        if_exists: str = "ask",
+    ) -> List[np.ndarray]:
         """
         用法：给定若干向量x构成的列表x_list，调用梯度函数g并行对每个x进行计算，返回梯度构成的列表
         """
@@ -86,30 +121,94 @@ class O1NumHess:
         elif total_cores % core != 0:
             warnings.warn(f"The number of cores specified by the user: {core} is not a divisor of the total number of cores: {total_cores}, may lead to performance issues.", RuntimeWarning)
 
+        # ==================== manage task
+        task_dir = self._getTaskdir(task_name)
+        self.task_config = {}
+        self.task_result = {}
+
+        # 创建或更新task.json
+        os.makedirs(task_dir)
+        self.task_config = {
+            "task_name": task_name,
+            "start_time": datetime.now().isoformat(), # YYYY-MM-DD HH:MM:SS.mmmmmm
+            "total_tasks": len(x_list),
+            "core": core,
+            "total_cores": total_cores,
+            "x_list_shapes": [x.shape for x in x_list], # TODO
+            "status": "running"
+        }
+        self._save2json(self.task_config, task_dir, self.task_cfg_json_name)
+
         # ==================== calculate
         n = len(x_list)  # 总任务数
-        max_concurrent = total_cores // core  # 最大并行任务数量
-        main_batch = n // max_concurrent * max_concurrent  # 前面的主要批次的任务数（阶段1）
-        tail_batch = n % max_concurrent  # 尾部剩余批次的任务数（阶段2）
-
         result:list[np.ndarray] = [None] * n # type: ignore
+
+        # ============ deal with incomplete task before
+        finished_gradient = 0
+        if if_exists == "continue" and task_dir.is_dir():
+            # clean .tmp file
+            for file in task_dir.glob("*.tmp"):
+                os.remove(file)
+
+            # check finished gradient
+            for i in range(n):
+                result_file = task_dir / f"result_{i:06d}.pkl" # TODO 命名格式
+                if os.path.exists(result_file):
+                    with open(result_file, 'rb') as f:
+                        result[i] = pickle.load(f)
+                    finished_gradient += 1
+
+            if self.verbosity > 0:
+                print(f"发现 {finished_gradient} 个已完成的任务，继续执行剩余 {n - finished_gradient} 个任务")
+
+        # ============ main part
+        max_concurrent = total_cores // core  # 最大并行任务数量
+        main_batch = (n - finished_gradient) // max_concurrent * max_concurrent  # 前面的主要批次的任务数（阶段1）
+        main_batch_index = n // max_concurrent * max_concurrent  # 前面的主要批次的任务数（阶段1）
+        tail_batch = (n - finished_gradient) % max_concurrent  # 尾部剩余批次的任务数（阶段2）
+        tail_batch_index = n % max_concurrent  # 尾部剩余批次的任务数（阶段2）
+        # TODO explain the 2 part design in doc and comments
 
         # 阶段1
         if main_batch > 0:
             with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
                 future_to_idx = {
                     executor.submit(
-                        self.grad_func,
+                        self._execute_single_task,
                         x_list[i],  # x
                         i,          # index
                         core,       # core
-                        **self.kwargs,
+                        task_dir,   # task_dir # TODO
                     ): i
-                    for i in range(main_batch)
+                    for i in range(main_batch_index)
+                    if result[i] is None  # 只提交未完成的任务
                 }
+
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
-                    result[idx] = future.result()
+                    try:
+                        result[idx] = future.result()
+                    except Exception as e:
+                        # TODO 处理计算错误
+                        error_info = {
+                            "task_index": idx,
+                            "error": str(e),
+                            "error_time": datetime.now().isoformat()
+                        }
+
+                        self.task_result = {
+                            "task_name": task_name,
+                            "status": "failed",
+                            "error": error_info,
+                            "completed_tasks": len([r for r in result if r is not None]),
+                            "total_tasks": n,
+                            "end_time": datetime.now().isoformat()
+                        }
+                        self._save2json(self.task_result, task_dir, self.task_result_json_name)
+
+                        # loop will be break, so the result_json will be written only once,
+                        # but other computation tasks that have already started will continue to execute without any further actions
+                        raise RuntimeError(f"task {idx} failed, see {task_dir / self.task_result_json_name} for more information \n {e}")
 
         # 阶段2
         if tail_batch > 0:
@@ -118,21 +217,63 @@ class O1NumHess:
             with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
                 future_to_idx = {
                     executor.submit(
-                        self.grad_func,
-                        x_list[i + main_batch], # x
-                        i + main_batch,         # index
-                        core_list[i],           # core
-                        **self.kwargs,
-                    ): i + main_batch
-                    for i in range(tail_batch)
+                        self._execute_single_task,
+                        x_list[i + main_batch_index],   # x
+                        i + main_batch_index,           # index
+                        core_list[i],                   # core
+                        task_dir,                       # task_dir
+                    ): i + main_batch_index
+                    for i in range(tail_batch_index)
+                    if result[i + main_batch_index] is None  # 只提交未完成的任务
                 }
+
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
-                    result[idx] = future.result()
+                    try:
+                        result[idx] = future.result()
+                    except Exception as e:
+                        # TODO 处理计算错误
+                        error_info = {
+                            "task_index": idx,
+                            "error": str(e),
+                            "error_time": datetime.now().isoformat()
+                        }
+
+                        self.task_result = {
+                            "task_name": task_name,
+                            "status": "failed",
+                            "error": error_info,
+                            "completed_tasks": len([r for r in result if r is not None]),
+                            "total_tasks": n,
+                            "end_time": datetime.now().isoformat()
+                        }
+                        self._save2json(self.task_result, task_dir, self.task_result_json_name)
+
+                        # loop will be break, so the result_json will be written only once,
+                        # but other computation tasks that have already started will continue to execute without any further actions
+                        raise RuntimeError(f"task {idx} failed, see {task_dir / self.task_result_json_name} for more information \n {e}")
+
+        # ============ calculate success
+        if self.verbosity > 4:
+            print(f"任务 {task_name} 并行部分完成")
+
+        self.task_result = {
+            "task_name": task_name,
+            "status": "completed",
+            "completed_tasks": n,
+            "total_tasks": n,
+        }
 
         return result
 
-    def singleSide(self, delta: float = 1e-6, core: int = 0, total_cores: Union[int, None] = None) -> np.ndarray:
+    def singleSide(
+        self,
+        delta: float = 1e-6,
+        core: int = 0,
+        total_cores: Union[int, None] = None,
+        task_name: str = "singleSide",
+        if_exists: str = "overwrite",
+    ) -> np.ndarray:
         r"""
         $$H_{ij}\approx\frac{g_{j}(x_{1},...,x_{i}+\Delta x,...,x_{n})-g_{j}(x_{1},...,x_{i},...,x_{n})}{\Delta x}$$
 
@@ -146,15 +287,28 @@ class O1NumHess:
         #  (x1   , x2+Δx, ..., xi   , ..., xn   ),
         #  (x1   , x2   , ..., xi+Δx, ..., xn   ),
         #  (x1   , x2   , ..., xi   , ..., xn+Δx)]
-        grad_and_grad_with_delta = self._parallel_execute(x_and_x_with_delta, core=core, total_cores=total_cores)
+        grad_and_grad_with_delta = self._parallel_execute(x_and_x_with_delta, core=core, total_cores=total_cores, task_name=task_name, if_exists=if_exists)
         # each line of x_and_x_with_delta will become grad here
         hessian:np.ndarray = (np.vstack(grad_and_grad_with_delta[1:]) - grad_and_grad_with_delta[0]) / delta # type: ignore
         # each line of np.vstack(grad_and_grad_with_delta[1:]) denotes g(..., x_i-Δx, ...)
         # each line minus grad_and_grad_with_delta[0] denotes g(..., x_i+Δx, ...) - g(..., x_i, ...)
 
+        # save result
+        self.task_result["end_time"] = datetime.now().isoformat()
+        self.task_result["method"] = "single"
+        self.task_result["hessian"] = hessian.tolist()
+        self._save2json(self.task_result, self._getTaskdir(task_name), self.task_result_json_name)
+
         return hessian
 
-    def doubleSide(self, delta: float = 1e-6, core: int = 0, total_cores: Union[int, None] = None) -> np.ndarray:
+    def doubleSide(
+        self,
+        delta: float = 1e-6,
+        core: int = 0,
+        total_cores: Union[int, None] = None,
+        task_name: str = "doubleSide",
+        if_exists: str = "overwrite",
+    ) -> np.ndarray:
         r"""
         $$H_{ij}\approx\frac{g_j(x_1,...,x_i+\Delta x,...,x_n)-g_j(x_1,...,x_i-\Delta x,...,x_n)}{2\Delta x}$$
 
@@ -162,11 +316,17 @@ class O1NumHess:
         """
         n = len(self.x)
         all_x_with_delta = [*(self.x + delta * np.eye(n)), *(self.x - delta * np.eye(n))]
-        all_grad_with_delta = self._parallel_execute(all_x_with_delta, core=core, total_cores=total_cores)
+        all_grad_with_delta = self._parallel_execute(all_x_with_delta, core=core, total_cores=total_cores, task_name=task_name, if_exists=if_exists)
         hessian = (np.vstack(all_grad_with_delta[:n]) - np.vstack(all_grad_with_delta[n:])) / (2 * delta) # type: ignore
         # np.vstack(all_grad_with_delta[:n]) denotes g(..., x_i+Δx, ...)
         # np.vstack(all_grad_with_delta[n:]) denotes g(..., x_i-Δx, ...)
         # view the comments in singleSide() for more information
+
+        # save result
+        self.task_result["end_time"] = datetime.now().isoformat()
+        self.task_result["method"] = "double"
+        self.task_result["hessian"] = hessian.tolist()
+        self._save2json(self.task_result, self._getTaskdir(task_name), self.task_result_json_name)
 
         return hessian
 
@@ -459,19 +619,20 @@ class O1NumHess:
 
         return hnum
 
-    def O1NumHess(self,
-                  core: int = 0,
-                  delta: float = 1e-6,
-                  total_cores: Union[int, None] = None,
-                  dmax: float = 1.0,
-                  distmat: np.ndarray = np.zeros([0,0]),
-                  H0: np.ndarray = np.zeros([0,0]),
-                  displdir: np.ndarray = np.zeros([0,0]),
-                  g: np.ndarray = np.zeros([0,0]),
-                  g0: np.ndarray = np.zeros(0),
-                  doublesided: np.ndarray = np.zeros(0, dtype=bool),
-                  gen_new_displdir: bool = True
-                  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def O1NumHess(
+        self,
+        core: int = 0,
+        delta: float = 1e-6,
+        total_cores: Union[int, None] = None,
+        dmax: float = 1.0,
+        distmat: np.ndarray = np.zeros([0,0]),
+        H0: np.ndarray = np.zeros([0,0]),
+        displdir: np.ndarray = np.zeros([0,0]),
+        g: np.ndarray = np.zeros([0,0]),
+        g0: np.ndarray = np.zeros(0),
+        doublesided: np.ndarray = np.zeros(0, dtype=bool),
+        gen_new_displdir: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         The O1NumHess algorithm.
         Input:  core        (number of parallel threads per gradient calculation)
