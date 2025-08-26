@@ -1,5 +1,9 @@
 # O1NumHess
 
+Calculate the seminumerical Hessian of an arbitrary N-variable function using only O(1) gradients, by assuming the Hessian has the off-diagonal low rank (ODLR) property.
+
+Details of the O1NumHess algorithm, as well as preliminary benchmark results, can be found in our preprint paper: https://arxiv.org/abs/2508.07544
+
 usage:
 
 ```bash
