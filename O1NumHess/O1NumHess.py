@@ -12,7 +12,7 @@ import pickle
 import shutil
 from datetime import datetime
 
-from typing import Any, Callable, Final, List, Union, Dict, Sequence, Tuple
+from typing import Any, Callable, List, Union, Dict, Sequence, Tuple
 
 
 class O1NumHess:
@@ -40,11 +40,36 @@ class O1NumHess:
         self.grad_func = grad_func
         self.kwargs = kwargs_for_grad_func
 
-        # for calculate
-        self.task_cfg_json_name: Final = "task.json"
-        self.task_result_json_name: Final = "task_result.json"
-        self.task_config = {}
-        self.task_result = {}
+        # for calculate - 断点续算相关
+        self.task_cfg_json_name = "task.json"
+        self.task_result_json_name = "task_result.json"
+
+        # 任务配置字典（既是模板也是实例，所有字段初始化为None）
+        self.task_config = {
+            "task_name": None,        # str, 任务名称
+            "method": None,           # str, "single"/"double"/"o1numhess"
+            "delta": None,            # float, 扰动步长
+            "start_time": None,       # str, ISO格式时间
+            "total_tasks": None,      # int, 总梯度数量
+            "core": None,             # int, 每个梯度的核心数
+            "total_cores": None,      # int, 总核心数
+            "x_first_size": None,     # int, 第一个x的大小(用于验证)
+            "status": None,           # str, "running"
+        }
+
+        # 任务结果字典
+        self.task_result = {
+            "task_name": None,        # str, 任务名称
+            "method": None,           # str, 计算方法
+            "delta": None,            # float, 扰动步长
+            "start_time": None,       # str, 开始时间
+            "end_time": None,         # str, 结束时间
+            "total_tasks": None,      # int, 总梯度数量
+            "completed_tasks": None,  # int, 已完成梯度数量
+            "status": None,           # str, "completed"/"failed"
+            "hessian": None,          # List[List[float]], 完成时的Hessian
+            "error": None,            # Dict, 失败时的错误信息
+        }
 
         # regularization parameters for _genODLRHessian
         self.lam = 1e-2
@@ -78,6 +103,81 @@ class O1NumHess:
             encoding="utf-8",
         )
         temp.rename(result)
+
+    def _execute_single_task(self, x, index, core, task_dir):
+        """执行单个梯度计算任务并保存结果"""
+        try:
+            # 执行梯度计算
+            grad_result = self.grad_func(x, index, core, **self.kwargs)
+
+            # 保存结果到临时文件
+            result_file = os.path.join(task_dir, f"result_{index:06d}.pkl")
+            temp_file = result_file + ".tmp"
+
+            with open(temp_file, 'wb') as f:
+                pickle.dump(grad_result, f)
+
+            # 原子性重命名，确保文件完整性
+            os.rename(temp_file, result_file)
+
+            return grad_result
+
+        except Exception as e:
+            # 清理可能的临时文件
+            temp_file = os.path.join(task_dir, f"result_{index:06d}.pkl.tmp")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            raise e
+
+    def _resolve_if_exists(self, task_dir: Path, if_exists: str):
+        """解析if_exists参数，将"ask"模式转换为具体的执行模式
+
+        返回值为 "error", "overwrite", 或 "continue"
+        """
+        if if_exists == "error":
+            return "error"
+
+        elif if_exists == "overwrite":
+            return "overwrite"
+
+        elif if_exists == "continue":
+            return "continue"
+
+        elif if_exists == "ask":
+            # 检查任务状态并打印信息
+            result_file = task_dir / self.task_result_json_name
+            config_file = task_dir / self.task_cfg_json_name
+
+            if result_file.exists():
+                result_data = json.loads(result_file.read_text(encoding="utf-8"))
+                status = result_data.get("status")
+                if status == "completed":
+                    print(f"Task '{task_dir.name}' already exists and is completed.")
+                elif status == "failed":
+                    print(f"Task '{task_dir.name}' already exists but failed.")
+            elif config_file.exists():
+                print(f"Task '{task_dir.name}' already exists and is incomplete.")
+            else:
+                print(f"Task '{task_dir.name}' already exists (no status info).")
+
+            # 询问用户
+            while True:
+                choice = input(
+                    "What do you want to do? (c)ontinue / (o)verwrite / (e)rror: "
+                ).strip().lower()
+
+                if choice in ("c", "continue"):
+                    return "continue"
+                elif choice in ("o", "overwrite"):
+                    return "overwrite"
+                elif choice in ("e", "error"):
+                    return "error"
+                else:
+                    print("Invalid choice. Please enter 'c', 'o', or 'e'.")
+
+        else:
+            raise ValueError(f"Invalid if_exists value: {if_exists}")
+
     def _parallel_execute(
         self,
         x_list: List[np.ndarray],
@@ -88,6 +188,23 @@ class O1NumHess:
     ) -> List[np.ndarray]:
         """
         用法：给定若干向量x构成的列表x_list，调用梯度函数g并行对每个x进行计算，返回梯度构成的列表
+
+        Parameters:
+        -----------
+        x_list : List[np.ndarray]
+            输入向量列表
+        core : int
+            每个梯度计算使用的核心数
+        total_cores : Union[int, None]
+            总核心数
+        task_name : str
+            任务名称，用于创建任务文件夹
+        if_exists : str
+            当任务文件夹已存在时的处理方式：
+            - "ask": 询问用户
+            - "continue": 继续未完成的计算
+            - "overwrite": 重新开始计算
+            - "error": 抛出错误
         """
         # ==================== check the cores
         # ensure total_cores is legal
@@ -105,7 +222,7 @@ class O1NumHess:
                 raise TypeError(f"total_cores must be int, {type(total_cores)} is given.")
             else: # total_cores is int
                 if not 1 <= total_cores <= cpu_count:
-                    raise ValueError(f"total_cores ({total_cores}) must <= os.cpu_count() ({cpu_count}) and= > 1")
+                    raise ValueError(f"total_cores ({total_cores}) must <= os.cpu_count() ({cpu_count}) and >= 1")
 
         # ensure core is legal
         if not isinstance(core, int):
@@ -121,56 +238,84 @@ class O1NumHess:
         elif total_cores % core != 0:
             warnings.warn(f"The number of cores specified by the user: {core} is not a divisor of the total number of cores: {total_cores}, may lead to performance issues.", RuntimeWarning)
 
-        # ==================== manage task
+        # ==================== Step 1: 处理任务文件夹的存在性，确定最终执行模式
+        n = len(x_list)
         task_dir = self._getTaskdir(task_name)
-        self.task_config = {}
-        self.task_result = {}
 
-        # 创建或更新task.json
-        os.makedirs(task_dir)
-        self.task_config = {
-            "task_name": task_name,
-            "start_time": datetime.now().isoformat(), # YYYY-MM-DD HH:MM:SS.mmmmmm
-            "total_tasks": len(x_list),
-            "core": core,
-            "total_cores": total_cores,
-            "x_list_shapes": [x.shape for x in x_list], # TODO
-            "status": "running"
-        }
+        # 如果任务文件夹已存在，解析if_exists参数（ask模式会询问用户）
+        if task_dir.is_dir():
+            if_exists = self._resolve_if_exists(task_dir, if_exists)
+
+            if if_exists == "error":
+                raise RuntimeError(f"任务文件夹 {task_dir} 已存在")
+            elif if_exists == "overwrite":
+                shutil.rmtree(task_dir)
+                os.makedirs(task_dir)
+            elif if_exists == "continue":
+                pass  # 不删除也不重建
+        else:
+            os.makedirs(task_dir)
+
+        # ==================== Step 2: 处理task.json
+        task_json_path = task_dir / self.task_cfg_json_name
+
+        if if_exists == "continue" and task_json_path.exists():
+            # Continue模式：读取并验证
+            old_config = json.loads(task_json_path.read_text(encoding="utf-8"))
+
+            # 验证关键参数
+            if old_config.get("total_tasks") != n:
+                raise ValueError(f"Task count mismatch: expected {n}, found {old_config.get('total_tasks')}")
+            if old_config.get("x_first_size") != self.task_config["x_first_size"]:
+                raise ValueError(f"Input size mismatch: expected {self.task_config['x_first_size']}, found {old_config.get('x_first_size')}")
+
+            # 保留原start_time
+            self.task_config["start_time"] = old_config.get("start_time")
+        else:
+            # 新任务或overwrite：创建新的start_time
+            self.task_config["start_time"] = datetime.now().isoformat() # type: ignore
+
+        # 更新status并写入task.json
+        self.task_config["status"] = "running" # type: ignore
         self._save2json(self.task_config, task_dir, self.task_cfg_json_name)
 
-        # ==================== calculate
-        n = len(x_list)  # 总任务数
+        # ==================== Step 3: Continue模式 - 清理临时文件并读取已完成的梯度
         result:list[np.ndarray] = [None] * n # type: ignore
-
-        # ============ deal with incomplete task before
         finished_gradient = 0
-        if if_exists == "continue" and task_dir.is_dir():
-            # clean .tmp file
-            for file in task_dir.glob("*.tmp"):
-                os.remove(file)
 
-            # check finished gradient
+        if if_exists == "continue":
+            # 清理.tmp文件
+            for tmp_file in task_dir.glob("*.tmp"):
+                os.remove(tmp_file)
+
+            # 读取已完成的梯度
             for i in range(n):
-                result_file = task_dir / f"result_{i:06d}.pkl" # TODO 命名格式
-                if os.path.exists(result_file):
+                result_file = task_dir / f"result_{i:06d}.pkl"
+                if result_file.exists():
                     with open(result_file, 'rb') as f:
-                        result[i] = pickle.load(f)
+                        grad = pickle.load(f)
+
+                    # 验证梯度长度
+                    expected_size = x_list[i].size
+                    if grad.size != expected_size:
+                        raise ValueError(f"Gradient {i} size mismatch: expected {expected_size}, found {grad.size}")
+
+                    result[i] = grad
                     finished_gradient += 1
 
-            if self.verbosity > 0:
+            if self.verbosity > 0: # TODO when to print
                 print(f"发现 {finished_gradient} 个已完成的任务，继续执行剩余 {n - finished_gradient} 个任务")
 
-        # ============ main part
+        # ==================== Step 4-5: 并行执行剩余的梯度计算
+        # 阶段1和阶段2的并行计算逻辑（保留原有逻辑，增加first_error机制）
         max_concurrent = total_cores // core  # 最大并行任务数量
-        main_batch = (n - finished_gradient) // max_concurrent * max_concurrent  # 前面的主要批次的任务数（阶段1）
-        main_batch_index = n // max_concurrent * max_concurrent  # 前面的主要批次的任务数（阶段1）
-        tail_batch = (n - finished_gradient) % max_concurrent  # 尾部剩余批次的任务数（阶段2）
-        tail_batch_index = n % max_concurrent  # 尾部剩余批次的任务数（阶段2）
-        # TODO explain the 2 part design in doc and comments
+        main_batch_index = n // max_concurrent * max_concurrent  # 阶段1的任务数
+        tail_batch_index = n % max_concurrent  # 阶段2的任务数
 
-        # 阶段1
-        if main_batch > 0:
+        first_error = None  # 记录第一个错误
+
+        # 阶段1：能占满CPU的批次
+        if main_batch_index > 0:
             with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
                 future_to_idx = {
                     executor.submit(
@@ -178,7 +323,7 @@ class O1NumHess:
                         x_list[i],  # x
                         i,          # index
                         core,       # core
-                        task_dir,   # task_dir # TODO
+                        task_dir,   # task_dir
                     ): i
                     for i in range(main_batch_index)
                     if result[i] is None  # 只提交未完成的任务
@@ -188,33 +333,17 @@ class O1NumHess:
                     idx = future_to_idx[future]
                     try:
                         result[idx] = future.result()
+                        finished_gradient += 1
                     except Exception as e:
-                        # TODO 处理计算错误
-                        error_info = {
-                            "task_index": idx,
-                            "error": str(e),
-                            "error_time": datetime.now().isoformat()
-                        }
+                        # 记录第一个错误但继续等待其他任务
+                        if first_error is None:
+                            first_error = (idx, str(e))
 
-                        self.task_result = {
-                            "task_name": task_name,
-                            "status": "failed",
-                            "error": error_info,
-                            "completed_tasks": len([r for r in result if r is not None]),
-                            "total_tasks": n,
-                            "end_time": datetime.now().isoformat()
-                        }
-                        self._save2json(self.task_result, task_dir, self.task_result_json_name)
-
-                        # loop will be break, so the result_json will be written only once,
-                        # but other computation tasks that have already started will continue to execute without any further actions
-                        raise RuntimeError(f"task {idx} failed, see {task_dir / self.task_result_json_name} for more information \n {e}")
-
-        # 阶段2
-        if tail_batch > 0:
-            # 每个任务固定分得 total_cores // tail_batch 个核心，前面 total_cores % tail_batch 个任务多分1个核心
-            core_list = [(total_cores // tail_batch) + 1 if i < (total_cores % tail_batch) else (total_cores // tail_batch) for i in range(tail_batch)]
-            with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        # 阶段2：尾部剩余任务，重新分配核心
+        if tail_batch_index > 0:
+            # 每个任务固定分得 total_cores // tail_batch_index 个核心，前面 total_cores % tail_batch_index 个任务多分1个核心
+            core_list = [(total_cores // tail_batch_index) + 1 if i < (total_cores % tail_batch_index) else (total_cores // tail_batch_index) for i in range(tail_batch_index)]
+            with ThreadPoolExecutor(max_workers=tail_batch_index) as executor:
                 future_to_idx = {
                     executor.submit(
                         self._execute_single_task,
@@ -231,38 +360,37 @@ class O1NumHess:
                     idx = future_to_idx[future]
                     try:
                         result[idx] = future.result()
+                        finished_gradient += 1
                     except Exception as e:
-                        # TODO 处理计算错误
-                        error_info = {
-                            "task_index": idx,
-                            "error": str(e),
-                            "error_time": datetime.now().isoformat()
-                        }
+                        # 记录第一个错误但继续等待其他任务
+                        if first_error is None:
+                            first_error = (idx, str(e))
 
-                        self.task_result = {
-                            "task_name": task_name,
-                            "status": "failed",
-                            "error": error_info,
-                            "completed_tasks": len([r for r in result if r is not None]),
-                            "total_tasks": n,
-                            "end_time": datetime.now().isoformat()
-                        }
-                        self._save2json(self.task_result, task_dir, self.task_result_json_name)
+        # ==================== Step 6: 如果有错误，保存失败状态并抛出异常
+        if first_error is not None:
+            i, error = first_error
+            self.task_result.update({
+                "task_name": task_name,
+                "method": self.task_config["method"],
+                "delta": self.task_config["delta"],
+                "start_time": self.task_config["start_time"],
+                "end_time": datetime.now().isoformat(),
+                "total_tasks": n,
+                "completed_tasks": finished_gradient,
+                "status": "failed",
+                "hessian": None,
+                "error": {
+                    "task_index": i,
+                    "error": error,
+                    "error_time": datetime.now().isoformat(),
+                },
+            }) # type: ignore
+            self._save2json(self.task_result, task_dir, self.task_result_json_name)
+            raise RuntimeError(f"Task {i} failed: {error}\nSee {task_dir / self.task_result_json_name} for more information")
 
-                        # loop will be break, so the result_json will be written only once,
-                        # but other computation tasks that have already started will continue to execute without any further actions
-                        raise RuntimeError(f"task {idx} failed, see {task_dir / self.task_result_json_name} for more information \n {e}")
-
-        # ============ calculate success
+        # ==================== Step 7: 所有梯度计算成功，返回结果
         if self.verbosity > 4:
             print(f"任务 {task_name} 并行部分完成")
-
-        self.task_result = {
-            "task_name": task_name,
-            "status": "completed",
-            "completed_tasks": n,
-            "total_tasks": n,
-        }
 
         return result
 
@@ -279,6 +407,22 @@ class O1NumHess:
 
         H_i = ( g(..., x_i+Δx, ...) - g(..., x_i, ...) ) / delta x
         """
+        # ========== Step 1: Continue模式快速返回检查
+        # continue模式下，如果任务已完成，直接返回结果
+        if if_exists == "continue":
+            task_dir = self._getTaskdir(task_name)
+            result_file = task_dir / self.task_result_json_name
+            if result_file.exists():
+                result_data = json.loads(result_file.read_text(encoding="utf-8"))
+                if result_data.get("status") == "completed":
+                    hessian_data = result_data.get("hessian")
+                    if hessian_data is None:
+                        raise ValueError(f"Task result corrupted: missing hessian in {result_file}")
+                    if self.verbosity > 0: # TODO when to print
+                        print(f"任务 {task_name} 已完成，直接返回已有结果")
+                    return np.array(hessian_data)
+
+        # ========== Step 2: 生成扰动后的坐标列表
         n = len(self.x)
         x_and_x_with_delta = [self.x, *(self.x + delta * np.eye(n))]
         # x_and_x_with_delta is like:  (n+1 row)
@@ -287,18 +431,54 @@ class O1NumHess:
         #  (x1   , x2+Δx, ..., xi   , ..., xn   ),
         #  (x1   , x2   , ..., xi+Δx, ..., xn   ),
         #  (x1   , x2   , ..., xi   , ..., xn+Δx)]
-        grad_and_grad_with_delta = self._parallel_execute(x_and_x_with_delta, core=core, total_cores=total_cores, task_name=task_name, if_exists=if_exists)
+
+        # ========== Step 3: 更新任务配置（供_parallel_execute使用）
+        self.task_config.update({
+            "task_name": task_name,
+            "method": "single",
+            "delta": delta,
+            "core": core,
+            "total_cores": total_cores,
+            "total_tasks": len(x_and_x_with_delta),
+            "x_first_size": self.x.size,
+            # start_time由_parallel_execute设置
+        }) # type: ignore
+
+        # ========== Step 4: 并行计算梯度
+        grad_and_grad_with_delta = self._parallel_execute(
+            x_and_x_with_delta,
+            core=core,
+            total_cores=total_cores,
+            task_name=task_name,
+            if_exists=if_exists,
+        )
+
+        # ========== Step 5: 计算Hessian矩阵
         # each line of x_and_x_with_delta will become grad here
         hessian:np.ndarray = (np.vstack(grad_and_grad_with_delta[1:]) - grad_and_grad_with_delta[0]) / delta # type: ignore
-        # each line of np.vstack(grad_and_grad_with_delta[1:]) denotes g(..., x_i-Δx, ...)
+        # each line of np.vstack(grad_and_grad_with_delta[1:]) denotes g(..., x_i+Δx, ...)
         # each line minus grad_and_grad_with_delta[0] denotes g(..., x_i+Δx, ...) - g(..., x_i, ...)
 
-        # save result
-        self.task_result["end_time"] = datetime.now().isoformat()
-        self.task_result["method"] = "single"
-        self.task_result["hessian"] = hessian.tolist()
-        self._save2json(self.task_result, self._getTaskdir(task_name), self.task_result_json_name)
+        # ========== Step 6: 保存完整结果
+        task_dir = self._getTaskdir(task_name)
+        self.task_result.update({
+            "task_name": task_name,
+            "method": "single",
+            "delta": delta,
+            "start_time": self.task_config["start_time"],
+            "end_time": datetime.now().isoformat(),
+            "total_tasks": len(x_and_x_with_delta),
+            "completed_tasks": len(x_and_x_with_delta),
+            "status": "completed",
+            "hessian": hessian.tolist(),
+            "error": None,
+        }) # type: ignore
+        self._save2json(self.task_result, task_dir, self.task_result_json_name)
 
+        # ========== Step 7: 删除任务文件夹（后期可通过注释这行来保留）
+        shutil.rmtree(task_dir)
+
+        # ========== Step 8: 返回Hessian
         return hessian
 
     def doubleSide(
@@ -314,20 +494,72 @@ class O1NumHess:
 
         H_i = ( g(..., x_i+Δx, ...) - g(..., x_i-Δx, ...) ) / 2 delta x
         """
+        # ========== Step 1: Continue模式快速返回检查
+        # continue模式下，如果任务已完成，直接返回结果
+        if if_exists == "continue":
+            task_dir = self._getTaskdir(task_name)
+            result_file = task_dir / self.task_result_json_name
+            if result_file.exists():
+                result_data = json.loads(result_file.read_text(encoding="utf-8"))
+                if result_data.get("status") == "completed":
+                    hessian_data = result_data.get("hessian")
+                    if hessian_data is None:
+                        raise ValueError(f"Task result corrupted: missing hessian in {result_file}")
+                    if self.verbosity > 0: # TODO when to print
+                        print(f"任务 {task_name} 已完成，直接返回已有结果")
+                    return np.array(hessian_data)
+
+        # ========== Step 2: 生成扰动后的坐标列表（双边）
         n = len(self.x)
         all_x_with_delta = [*(self.x + delta * np.eye(n)), *(self.x - delta * np.eye(n))]
-        all_grad_with_delta = self._parallel_execute(all_x_with_delta, core=core, total_cores=total_cores, task_name=task_name, if_exists=if_exists)
+
+        # ========== Step 3: 更新任务配置
+        self.task_config.update({
+            "task_name": task_name,
+            "method": "double",
+            "delta": delta,
+            "core": core,
+            "total_cores": total_cores,
+            "total_tasks": len(all_x_with_delta),
+            "x_first_size": self.x.size,
+            # start_time由_parallel_execute设置
+        }) # type: ignore
+
+        # ========== Step 4: 并行计算梯度
+        all_grad_with_delta = self._parallel_execute(
+            all_x_with_delta,
+            core=core,
+            total_cores=total_cores,
+            task_name=task_name,
+            if_exists=if_exists
+        )
+
+        # ========== Step 5: 计算Hessian矩阵
         hessian = (np.vstack(all_grad_with_delta[:n]) - np.vstack(all_grad_with_delta[n:])) / (2 * delta) # type: ignore
         # np.vstack(all_grad_with_delta[:n]) denotes g(..., x_i+Δx, ...)
         # np.vstack(all_grad_with_delta[n:]) denotes g(..., x_i-Δx, ...)
         # view the comments in singleSide() for more information
 
-        # save result
-        self.task_result["end_time"] = datetime.now().isoformat()
-        self.task_result["method"] = "double"
-        self.task_result["hessian"] = hessian.tolist()
-        self._save2json(self.task_result, self._getTaskdir(task_name), self.task_result_json_name)
+        # ========== Step 6: 保存完整结果
+        task_dir = self._getTaskdir(task_name)
+        self.task_result.update({
+            "task_name": task_name,
+            "method": "double",
+            "delta": delta,
+            "start_time": self.task_config["start_time"],
+            "end_time": datetime.now().isoformat(),
+            "total_tasks": len(all_x_with_delta),
+            "completed_tasks": len(all_x_with_delta),
+            "status": "completed",
+            "hessian": hessian.tolist(),
+            "error": None,
+        }) # type: ignore
+        self._save2json(self.task_result, task_dir, self.task_result_json_name)
 
+        # ========== Step 7: 删除任务文件夹（后期可通过注释这行来保留）
+        shutil.rmtree(task_dir)
+
+        # ========== Step 8: 返回Hessian
         return hessian
 
     def _neighborList(self,
@@ -744,7 +976,7 @@ class O1NumHess:
         # Calculate the gradients
         if self.verbosity > 1:
             print("Start gradient calculations...")
-        grad_with_delta = self._parallel_execute(x_with_delta, total_cores=total_cores, core=core)
+        grad_with_delta = self._parallel_execute(x_with_delta, total_cores=total_cores, core=core, task_name="O1NumHess")
         if self.verbosity > 1:
             print("Gradient calculations finished")
             if self.verbosity > 5:
