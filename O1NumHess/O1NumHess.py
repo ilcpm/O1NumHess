@@ -21,8 +21,8 @@ class O1NumHess:
         x: Union[np.ndarray, np.matrix, List[float]],
         # /, # `/` only available in python >= 3.8
         grad_func: Callable[..., np.ndarray],
-        verbosity:int = 0,
-        **kwargs_for_grad_func, # TODO kwargs for func g can be specified both here and called?
+        verbosity: int = 0,
+        **kwargs_for_grad_func,  # TODO kwargs for func g can be specified both here and called?
     ):
         self.verbosity = verbosity
 
@@ -84,35 +84,54 @@ class O1NumHess:
         self.mingrad_LR = 1e-3
 
     def setVerbosity(self, verbosity: int):
+        """Set the verbosity level. TODO verbosity meanning
+
+        Args:
+            verbosity (int): New verbosity level.
+        """
         self.verbosity = verbosity
 
-    def setParams(self,
-                  lam: Union[float, None] = None,
-                  bet: Union[float, None] = None,
-                  ddmax: Union[float, None] = None,
-                  maxiter_LR: Union[int, None] = None,
-                  thresh_LR: Union[float, None] = None,
-                  mingrad_LR: Union[float, None] = None,
-                  ):
-        """
-        Set the less important parameters.
-        """
-        if lam != None: self.lam = lam
-        if bet != None: self.bet = bet
-        if ddmax != None: self.ddmax = ddmax
-        if maxiter_LR != None: self.maxiter_LR = maxiter_LR
-        if thresh_LR != None: self.thresh_LR = thresh_LR
-        if mingrad_LR != None: self.mingrad_LR = mingrad_LR
+    def setParams(
+        self,
+        lam: Union[float, None] = None,
+        bet: Union[float, None] = None,
+        ddmax: Union[float, None] = None,
+        maxiter_LR: Union[int, None] = None,
+        thresh_LR: Union[float, None] = None,
+        mingrad_LR: Union[float, None] = None,
+    ):
+        if lam is not None:
+            self.lam = lam
+        if bet is not None:
+            self.bet = bet
+        if ddmax is not None:
+            self.ddmax = ddmax
+        if maxiter_LR is not None:
+            self.maxiter_LR = maxiter_LR
+        if thresh_LR is not None:
+            self.thresh_LR = thresh_LR
+        if mingrad_LR is not None:
+            self.mingrad_LR = mingrad_LR
 
     @staticmethod
     def _getTaskdir(task_name: str) -> Path:
+        """Return the task working directory path for a task name."""
         return Path(f"O1NH_{task_name}")
 
     @staticmethod
-    def _save2json(obj:Dict, path: Union[Path, str] = ".", filename: str = ""):
-        """save dict to json file, used to save config and result"""
+    def _save2json(obj: Dict, path: Union[Path, str] = ".", filename: str = ""):
+        """Write a dict to JSON atomically via a temporary file. Used for saving config and result
+
+        ``~`` in path will be expanded, and the final path will be absolute and normalized.
+
+        Args:
+            obj: Serializable object to write.
+            path: Target folder.
+            filename: Target filename.
+        """
         if not isinstance(filename, str) or not filename:
             raise ValueError("filename invalid")
+        path = getAbsPath(path)
         os.makedirs(path, exist_ok=True)
 
         temp = Path(path) / (filename + ".tmp")
@@ -133,7 +152,7 @@ class O1NumHess:
             result_file = os.path.join(task_dir, f"result_{index:06d}.pkl")
             temp_file = result_file + ".tmp"
 
-            with open(temp_file, 'wb') as f:
+            with open(temp_file, "wb") as f:
                 pickle.dump(grad_result, f)
 
             # Atomic rename to ensure file integrity
@@ -194,9 +213,7 @@ class O1NumHess:
 
             # Ask user
             while True:
-                choice = input(
-                    "What do you want to do? (c)ontinue / (o)verwrite / (e)rror: "
-                ).strip().lower()
+                choice = input("What do you want to do? (c)ontinue / (o)verwrite / (e)rror: ").strip().lower()
 
                 if choice in ("c", "continue"):
                     return "continue"
@@ -210,11 +227,11 @@ class O1NumHess:
         else:
             raise ValueError(f"Invalid if_exists value: {if_exists}")
 
-    def _parallel_execute(
+    def _parallel_execute( # TODO check all reference
         self,
         x_list: List[np.ndarray],
         core: int = 1,
-        total_cores: Union[int, None] = None, # type: ignore
+        total_cores: Union[int, None] = None,  # type: ignore
         task_name: str = "hessian",
         if_exists: str = "ask",
     ) -> List[np.ndarray]:
@@ -243,6 +260,11 @@ class O1NumHess:
 
         Returns:
             List[np.ndarray]: Gradient list, each element corresponds to gradient calculation result at corresponding position in x_list
+
+        Raises:
+            RuntimeError: If any sub-task fails.
+            TypeError: If ``core`` or ``total_cores`` has an invalid type.
+            ValueError: If core/task configuration is inconsistent.
         """
         # ==================== check the cores
         # ensure total_cores is legal
@@ -452,10 +474,20 @@ class O1NumHess:
         task_name: str = "singleSide",
         if_exists: str = "overwrite",
     ) -> np.ndarray:
-        r"""
-        $$H_{ij}\approx\frac{g_{j}(x_{1},...,x_{i}+\Delta x,...,x_{n})-g_{j}(x_{1},...,x_{i},...,x_{n})}{\Delta x}$$
+        """Compute Hessian with single-sided finite differences.
 
-        H_i = ( g(..., x_i+Δx, ...) - g(..., x_i, ...) ) / delta x
+        Formula:
+            H[i, j] ~= (g_j(x + delta * e_i) - g_j(x)) / delta
+
+        Args:
+            delta: Finite-difference step size.
+            core: Core count per gradient task.
+            total_cores: Total cores available to this run.
+            task_name: Checkpoint task name.
+            if_exists: Existing-task behavior. # TODO how to supply options for users
+
+        Returns:
+            The estimated Hessian matrix.
         """
         # ========== continue mode quick return check
         # In continue mode, if task is completed, return result directly
@@ -636,58 +668,63 @@ class O1NumHess:
         for i in range(N):
             nblist.append([])
             for j in range(N):
-                if distmat[i,j]<dmax:
+                if distmat[i, j] < dmax:
                     nblist[i].append(j)
 
-        ncomp, labels = connected_components(distmat<dmax)
+        ncomp, labels = connected_components(distmat < dmax)
         maxdist = np.max(distmat)
         # constituent indices of each connected component
-        comp_ind = [[]]*ncomp
+        comp_ind = [[]] * ncomp
         for i in range(ncomp):
-            comp_ind[i] = np.nonzero(labels==i)[0].tolist()
+            comp_ind[i] = np.nonzero(labels == i)[0].tolist()
 
         # for each pair of connected components, connect the closest pair(s) of indices
         # between this pair of connected components. Also record the closest contact distance
-        distmat_comp = np.zeros([ncomp,ncomp])
+        distmat_comp = np.zeros([ncomp, ncomp])
         # iibest[i,j]: the list of indices of component i that are closest to component j
         iibest = {}
         for i in range(ncomp):
-            for j in range(i+1,ncomp):
+            for j in range(i + 1, ncomp):
                 d = maxdist
-                iibest[i,j] = []
+                iibest[i, j] = []
                 for ii in comp_ind[i]:
                     for jj in comp_ind[j]:
-                        if distmat[ii,jj] < d - eps:
-                            d = distmat[ii,jj]
-                            iibest[i,j] = [ii]
-                            iibest[j,i] = [jj]
-                        elif distmat[ii,jj] < d + eps: # account for distance degeneracy
-                            if not ii in iibest[i,j]: iibest[i,j].append(ii)
-                            if not jj in iibest[j,i]: iibest[j,i].append(jj)
-                distmat_comp[i,j] = d
-                distmat_comp[j,i] = d
+                        if distmat[ii, jj] < d - eps:
+                            d = distmat[ii, jj]
+                            iibest[i, j] = [ii]
+                            iibest[j, i] = [jj]
+                        elif distmat[ii, jj] < d + eps:  # account for distance degeneracy
+                            if ii not in iibest[i, j]:
+                                iibest[i, j].append(ii)
+                            if jj not in iibest[j, i]:
+                                iibest[j, i].append(jj)
+                distmat_comp[i, j] = d
+                distmat_comp[j, i] = d
 
         # generate minimum spanning tree
         tree = minimum_spanning_tree(distmat_comp).toarray()
 
         # connect the closest index pairs
         for i in range(ncomp):
-            for j in range(i+1,ncomp):
-                if tree[i,j] >= 1e-8: # components i and j are connected in the tree
-                    for ii in iibest[i,j]:
-                        for jj in iibest[j,i]:
-                            if not jj in nblist[ii]: nblist[ii].append(jj)
-                            if not ii in nblist[jj]: nblist[jj].append(ii)
+            for j in range(i + 1, ncomp):
+                if tree[i, j] >= 1e-8:  # components i and j are connected in the tree
+                    for ii in iibest[i, j]:
+                        for jj in iibest[j, i]:
+                            if jj not in nblist[ii]:
+                                nblist[ii].append(jj)
+                            if ii not in nblist[jj]:
+                                nblist[jj].append(ii)
 
         return nblist
 
-    def _gen_displdir(self,
-                      nblist: Sequence[Sequence],
-                      H0: np.ndarray,
-                      displdir0: np.ndarray,
-                      eps: float = 1e-8,
-                      eps2: float = 1e-15,
-                      ) -> np.ndarray:
+    def _gen_displdir(
+        self,
+        nblist: Sequence[Sequence],
+        H0: np.ndarray,
+        displdir0: np.ndarray,
+        eps: float = 1e-8,
+        eps2: float = 1e-15,
+    ) -> np.ndarray:
         '''
         Generate displacement directions for O1NumHess.
         Input:  x (the vector of variables)
@@ -704,12 +741,12 @@ class O1NumHess:
 
         # Allocate an array for all displacement directions, assuming the maximum possible
         # number of directions. Finally we'll truncate the array if necessary
-        displdir = np.zeros([N,N])
-        displdir[:,0:Ndispl0] = displdir0
+        displdir = np.zeros([N, N])
+        displdir[:, 0:Ndispl0] = displdir0
 
         early_break = True
-        i = 0 # necessary in case N==Ndispl0
-        for i in range(N-Ndispl0):
+        i = 0  # necessary in case N == Ndispl0
+        for i in range(N - Ndispl0):
             # Generation of seed vectors
             ev = np.zeros(N)
             coverage = np.zeros(N)
@@ -717,30 +754,30 @@ class O1NumHess:
                 # If the displacement directions already span the whole space spanned by
                 # the indices in the local neighborhood of index i, skip
                 nnb = len(nblist[j])
-                if nnb <= i+Ndispl0:
+                if nnb <= i + Ndispl0:
                     continue
-                submat = H0[np.ix_(nblist[j],nblist[j])]
+                submat = H0[np.ix_(nblist[j], nblist[j])]
 
                 # Local projection
-                proj = orth(displdir[np.ix_(nblist[j],range(i+Ndispl0))])
-                proj = np.eye(nnb) - np.matmul(proj,proj.T)
-                submat = np.matmul(proj,np.matmul(submat,proj.T))
-                submat = 0.5*(submat+submat.T)
+                proj = orth(displdir[np.ix_(nblist[j], range(i + Ndispl0))])
+                proj = np.eye(nnb) - np.matmul(proj, proj.T)
+                submat = np.matmul(proj, np.matmul(submat, proj.T))
+                submat = 0.5 * (submat + submat.T)
 
                 # Start an independent direction.
                 # Use Hermitian diagonalization function to avoid complex eigenvaloues.
                 loceig, locev = np.linalg.eigh(submat)
                 locind = np.argmax(loceig)
-                locev = locev[:,locind]
+                locev = locev[:, locind]
 
                 # Fix sign
-                ev1 = (coverage[nblist[j]]*ev[nblist[j]] + locev)/(coverage[nblist[j]]+1)
-                ev2 = (coverage[nblist[j]]*ev[nblist[j]] - locev)/(coverage[nblist[j]]+1)
+                ev1 = (coverage[nblist[j]] * ev[nblist[j]] + locev) / (coverage[nblist[j]] + 1)
+                ev2 = (coverage[nblist[j]] * ev[nblist[j]] - locev) / (coverage[nblist[j]] + 1)
                 norm1 = np.linalg.norm(ev1)
                 norm2 = np.linalg.norm(ev2)
-                if norm1>norm2+eps:
+                if norm1 > norm2 + eps:
                     ev[nblist[j]] = ev1
-                elif norm1<norm2-eps:
+                elif norm1 < norm2 - eps:
                     ev[nblist[j]] = ev2
                 else:
                     # To make the result as deterministic as possible, here we arbitrarily
@@ -754,22 +791,22 @@ class O1NumHess:
                 coverage[nblist[j]] += 1
 
             # project out previous displacement vectors
-            for j in range(i+Ndispl0):
-                ev -= np.dot(ev,displdir[:,j])*displdir[:,j]
+            for j in range(i + Ndispl0):
+                ev -= np.dot(ev, displdir[:, j]) * displdir[:, j]
             n = np.linalg.norm(ev)
-            if n<eps2:
+            if n < eps2:
                 early_break = True
                 break
             else:
                 early_break = False
 
             ev /= n
-            displdir[:,i+Ndispl0] = ev
+            displdir[:, i + Ndispl0] = ev
 
-        Ndispl = i+Ndispl0
+        Ndispl = i + Ndispl0
         if not early_break:
             Ndispl += 1
-        displdir = displdir[:,0:Ndispl]
+        displdir = displdir[:, 0:Ndispl]
 
         return displdir
 
@@ -779,7 +816,7 @@ class O1NumHess:
         (1) Only those element where mask==True are kept
         (2) H is symmetrized, and then the symmetry of H is used.
         """
-        H = (H + H.T)/2.
+        H = (H + H.T) / 2.0
         return H[np.tril(mask)]
 
     def _inv_vech0(self, v: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -787,10 +824,10 @@ class O1NumHess:
         The inverse function of _vech0. Always returns a symmetric matrix.
         """
         N = mask.shape[0]
-        H = np.zeros([N,N])
+        H = np.zeros([N, N])
         H[np.tril(mask)] = v
-        for i in range(1,N):
-            H[0:i,i] = H[i,0:i]
+        for i in range(1, N):
+            H[0:i, i] = H[i, 0:i]
         #mask1 = np.tril(mask)
         #k = 0
         #for i in range(N):
@@ -801,12 +838,13 @@ class O1NumHess:
         #            k += 1
         return H
 
-    def _genLocalHessian(self,
-                         distmat: np.ndarray,
-                         displdir: np.ndarray,
-                         g: np.ndarray,
-                         dmax: float,
-                         ) -> np.ndarray:
+    def _genLocalHessian(
+        self,
+        distmat: np.ndarray,
+        displdir: np.ndarray,
+        g: np.ndarray,
+        dmax: float,
+    ) -> np.ndarray:
         """
         Given the distance matrix, a list of displacement directions, and the gradients
         along these displacement directions (divided by the step length), recover the
@@ -818,38 +856,38 @@ class O1NumHess:
             tstart = time.time()
 
         # Regularization term
-        W2 = self.lam * np.maximum(0.,distmat-dmax)**(2.*self.bet) # type: ignore
+        W2 = self.lam * np.maximum(0.0, distmat - dmax) ** (2.0 * self.bet)  # type: ignore
 
         # Prepare the RHS vector. This also gives the dimension of the problem
-        RHS = np.matmul(g,displdir.T)
-        RHS = (RHS+RHS.T)/2.
-        mask: np.ndarray = distmat<(dmax+self.ddmax) # type: ignore
+        RHS = np.matmul(g, displdir.T)
+        RHS = (RHS + RHS.T) / 2.0
+        mask: np.ndarray = distmat < (dmax + self.ddmax)  # type: ignore
         RHSv = self._vech0(RHS, mask)
         Ndim = RHSv.size
 
         # Define the MVP function as a LinearOperator
         from scipy.sparse.linalg import LinearOperator, gmres
-        f1 = lambda v: np.matmul(np.matmul(self._inv_vech0(v, mask),displdir),displdir.T)
-        f = lambda v: self._vech0(f1(v) + W2*self._inv_vech0(v, mask), mask)
-        A = LinearOperator((Ndim,Ndim), matvec=f)
+        f1 = lambda v: np.matmul(np.matmul(self._inv_vech0(v, mask), displdir), displdir.T)
+        f = lambda v: self._vech0(f1(v) + W2 * self._inv_vech0(v, mask), mask)
+        A = LinearOperator((Ndim, Ndim), matvec=f) # pyright: ignore[reportCallIssue]
 
         # Call GMRES
         # TODO: implement preconditioner
         hnumv, info = gmres(A, RHSv, x0=RHSv, atol=1e-14, maxiter=1000)
-        if info!=0:
-            print('Warning: gmres returned with error code %d'%info)
+        if info != 0:
+            print("Warning: gmres returned with error code %d" % info)
 
         # Recover the desired Hessian (local part)
         hnum = self._inv_vech0(hnumv, mask)
         if self.verbosity > 2:
             tend = time.time()
-            err = np.linalg.norm(g - np.matmul(hnum,displdir))
-            print('Successful termination of _genLocalHessian, time = %.2f sec'%(tend-tstart)) # type: ignore
+            err = np.linalg.norm(g - np.matmul(hnum, displdir))
+            print("Successful termination of _genLocalHessian, time = %.2f sec" % (tend - tstart))  # type: ignore
             if self.verbosity > 5:
                 print('Local part of the Hessian:')
                 with np.printoptions(threshold=10000, edgeitems=50):
                     print(hnum)
-            print('Error norm of the predicted gradient: %.2e'%err)
+            print("Error norm of the predicted gradient: %.2e" % err)
 
         return hnum
 
@@ -866,32 +904,32 @@ class O1NumHess:
         g = np.zeros(g_in.shape)
         displdir = np.zeros(d_in.shape)
         for i in range(g.shape[1]):
-            norm_gi = max(np.linalg.norm(g[:,i]), self.mingrad_LR)
-            g[:,i] = self.mingrad_LR/norm_gi*g_in[:,i]
-            displdir[:,i] = self.mingrad_LR/norm_gi*d_in[:,i]
+            norm_gi = max(np.linalg.norm(g[:, i]), self.mingrad_LR)
+            g[:, i] = self.mingrad_LR / norm_gi * g_in[:, i]
+            displdir[:, i] = self.mingrad_LR / norm_gi * d_in[:, i]
 
         dampfac = 1.0
         err0 = np.inf
         norm_g = np.linalg.norm(g)
         for it in range(self.maxiter_LR):
-            resid = g - np.matmul(hnum,displdir)
+            resid = g - np.matmul(hnum, displdir)
             err = np.linalg.norm(resid)
             if err < self.thresh_LR:
                 break
-            elif abs(err-err0) < self.thresh_LR*err0:
-                print('The gradients cannot be exactly reproduced by a symmetric Hessian.')
+            elif abs(err - err0) < self.thresh_LR * err0:
+                print("The gradients cannot be exactly reproduced by a symmetric Hessian.")
                 break
-            elif err > err0 and err > norm_g: # iterations diverge
+            elif err > err0 and err > norm_g:  # iterations diverge
                 dampfac *= 0.5
                 if self.verbosity > 1:
-                    print('Warning: error too large, damping the correction by a factor of %.2e'%dampfac)
+                    print("Warning: error too large, damping the correction by a factor of %.2e" % dampfac)
             if self.verbosity > 4:
-                print('Iter %3d error %.2e'%(it,err))
+                print("Iter %3d error %.2e" % (it, err))
             hcorr = np.matmul(resid, displdir.T)
-            hcorr = (hcorr+hcorr.T)/2.
-            hnum += dampfac*hcorr
+            hcorr = (hcorr + hcorr.T) / 2.0
+            hnum += dampfac * hcorr
             err0 = err
-        return hnum, err
+        return hnum, err # pyright: ignore[reportPossiblyUnboundVariable]
 
     def _genODLRHessian(self,
                         distmat: np.ndarray,
@@ -917,8 +955,8 @@ class O1NumHess:
 
         if self.verbosity > 2:
             tend = time.time()
-            print('Successful termination of _genODLRHessian, time = %.2f sec'%(tend-tstart)) # type: ignore
-            print('Error norm of the predicted gradient: %.2e'%err) # type: ignore
+            print("Successful termination of _genODLRHessian, time = %.2f sec" % (tend - tstart))  # type: ignore
+            print("Error norm of the predicted gradient: %.2e" % err)  # type: ignore
 
         return hnum
 
@@ -973,42 +1011,42 @@ class O1NumHess:
         N = self.x.size
 
         # Default values
-        if distmat.size==0:
-            distmat = abs(np.mgrid[N,N][0]-np.mgrid[N,N][1])
-        if H0.size==0:
+        if distmat.size == 0:
+            distmat = abs(np.mgrid[N, N][0] - np.mgrid[N, N][1])
+        if H0.size == 0:
             H0 = np.eye(N)
-        if displdir.size==0:
-            displdir = np.zeros([N,0])
-        if g.size==0:
-            g = np.zeros([N,0])
-        if g0.size==0:
+        if displdir.size == 0:
+            displdir = np.zeros([N, 0])
+        if g.size == 0:
+            g = np.zeros([N, 0])
+        if g0.size == 0:
             # Calculate the gradient at the unperturbed x.
             # We parallelize this calculation using all available cores.
             # The calculation has index 2*N, to avoid clashing with other displacement directions
-            g0 = self.grad_func(self.x,2*N,total_cores,**self.kwargs)
+            g0 = self.grad_func(self.x, 2 * N, total_cores, **self.kwargs)
 
         # Orthonormalize the input displdir. if there is any
         Ndispl0 = displdir.shape[1]
         for i in range(displdir.shape[1]):
-            if i>=Ndispl0:
+            if i >= Ndispl0:
                 break
-            n = np.linalg.norm(displdir[:,i])
-            if n==0:
-                raise ZeroDivisionError('Displacement direction %d is a zero vector'%i)
-            displdir[:,i] /= n
+            n = np.linalg.norm(displdir[:, i])
+            if n == 0:
+                raise ZeroDivisionError("Displacement direction %d is a zero vector" % i)
+            displdir[:, i] /= n
             for j in range(i):
-                displdir[:,i] -= np.dot(displdir[:,i],displdir[:,j])*displdir[:,j]
-            n = np.linalg.norm(displdir[:,i])
-            if n==0: # displacement direction i is redundant
+                displdir[:, i] -= np.dot(displdir[:, i], displdir[:, j]) * displdir[:, j]
+            n = np.linalg.norm(displdir[:, i])
+            if n == 0:  # displacement direction i is redundant
                 # move forward
                 # This will make displdir[:,-1] identical to displdir[:,-2]
-                displdir[:,i:-1] = displdir[:,i+1:]
+                displdir[:, i:-1] = displdir[:, i + 1 :]
                 Ndispl0 -= 1
             else:
-                displdir[:,i] /= n
+                displdir[:, i] /= n
 
         if self.verbosity > 1:
-            print("%d displacement directions given on input"%Ndispl0)
+            print("%d displacement directions given on input" % Ndispl0)
         if gen_new_displdir:
             # Get the neighbors of each entry
             nblist = self._neighborList(distmat, dmax)
@@ -1016,8 +1054,8 @@ class O1NumHess:
             # Generate displacement directions
             displdir = self._gen_displdir(nblist, H0, displdir)
             if self.verbosity > 1:
-                print("%d displacement directions generated"%(displdir.shape[1]-Ndispl0))
-                print("Total number of displacement directions: %d"%displdir.shape[1])
+                print("%d displacement directions generated" % (displdir.shape[1] - Ndispl0))
+                print("Total number of displacement directions: %d" % displdir.shape[1])
 
         Ndispl = displdir.shape[1]
         Ng = g.shape[1]
@@ -1026,11 +1064,11 @@ class O1NumHess:
             for j in range(N):
                 # Because all displacement directions are normalized, it is guaranteed
                 # that at least one j satisfies the following
-                if abs(displdir[j,i])>0.5/math.sqrt(N):
-                    if displdir[j,i]<0:
-                        displdir[:,i] *= -1.0
-                        if i<Ng:
-                            g[:,i] *= -1.0
+                if abs(displdir[j, i]) > 0.5 / math.sqrt(N):
+                    if displdir[j, i] < 0:
+                        displdir[:, i] *= -1.0
+                        if i < Ng:
+                            g[:, i] *= -1.0
                     break
 
         if gen_new_displdir:
@@ -1044,30 +1082,32 @@ class O1NumHess:
         # (1) Along some directions we need to do double-sided differentiation
         # (2) For some displacement directions, the corresponding gradients have already
         #     been given in g
-        Ngrad = Ndispl-Ng+np.sum(doublesided[Ng:Ndispl])
+        Ngrad = Ndispl - Ng + np.sum(doublesided[Ng:Ndispl])
         if self.verbosity > 1:
-            print("%d gradients will be calculated"%Ngrad)
+            print("%d gradients will be calculated" % Ngrad)
 
         # Make the largest absolute element of the displacements equal to delta.
         # This gives numerically more stable results than making the norms of
         # the displacements equal to delta
-        max_displdir = np.zeros(Ndispl-Ng)
-        for i in range(Ndispl-Ng):
-            max_displdir[i] = np.max(np.abs(displdir[:,i+Ng]))
+        max_displdir = np.zeros(Ndispl - Ng)
+        for i in range(Ndispl - Ng):
+            max_displdir[i] = np.max(np.abs(displdir[:, i + Ng]))
 
-        x_with_delta = np.zeros([Ngrad,N])
-        for i in range(Ndispl-Ng):
-            x_with_delta[i,:] = self.x + delta/max_displdir[i]*displdir[:,i+Ng]
-        j = Ndispl-Ng
-        for i in range(Ndispl-Ng):
-            if doublesided[i+Ng]:
-                x_with_delta[j,:] = self.x - delta/max_displdir[i]*displdir[:,i+Ng]
+        x_with_delta = np.zeros([Ngrad, N])
+        for i in range(Ndispl - Ng):
+            x_with_delta[i, :] = self.x + delta / max_displdir[i] * displdir[:, i + Ng]
+        j = Ndispl - Ng
+        for i in range(Ndispl - Ng):
+            if doublesided[i + Ng]:
+                x_with_delta[j, :] = self.x - delta / max_displdir[i] * displdir[:, i + Ng]
                 j += 1
 
         # Calculate the gradients
         if self.verbosity > 1:
             print("Start gradient calculations...")
-        grad_with_delta = self._parallel_execute(x_with_delta, total_cores=total_cores, core=core, task_name="O1NumHess")
+        grad_with_delta = self._parallel_execute( # TODO type check
+            x_with_delta, total_cores=total_cores, core=core, task_name="O1NumHess"
+        )
         if self.verbosity > 1:
             print("Gradient calculations finished")
             if self.verbosity > 5:
@@ -1076,15 +1116,15 @@ class O1NumHess:
                     print(grad_with_delta)
 
         # Divide the step length, taking special care of double-sided displacement directions
-        gout = np.zeros([N,Ndispl])
-        gout[:,0:Ng] = g
-        j = Ndispl-Ng
-        for i in range(Ng,Ndispl):
+        gout = np.zeros([N, Ndispl])
+        gout[:, 0:Ng] = g
+        j = Ndispl - Ng
+        for i in range(Ng, Ndispl):
             if doublesided[i]:
-                gout[:,i] = (grad_with_delta[i-Ng]-grad_with_delta[j])/(2.*delta)*max_displdir[i-Ng]
+                gout[:, i] = (grad_with_delta[i - Ng] - grad_with_delta[j]) / (2.0 * delta) * max_displdir[i - Ng]
                 j += 1
             else:
-                gout[:,i] = (grad_with_delta[i-Ng]-g0)/delta*max_displdir[i-Ng]
+                gout[:, i] = (grad_with_delta[i - Ng] - g0) / delta * max_displdir[i - Ng]
         if self.verbosity > 5:
             print("Gradient derivatives:")
             with np.printoptions(threshold=10000, edgeitems=50):
@@ -1110,7 +1150,7 @@ class O1NumHess:
             delta_forward[i] += delta
             forward = self.grad_func(delta_forward, 0, **self.kwargs)
             delta_g.append(forward - org)
-        hessian = np.vstack(delta_g) / delta # type: ignore
+        hessian = np.vstack(delta_g) / delta  # type: ignore
 
         return hessian
 
@@ -1131,6 +1171,6 @@ class O1NumHess:
             forward = self.grad_func(delta_forward, 0, **self.kwargs)
             backward = self.grad_func(delta_backward, 0, **self.kwargs)
             delta_g.append(forward - backward)
-        hessian = np.vstack(delta_g) / (2 * delta) # type: ignore
+        hessian = np.vstack(delta_g) / (2 * delta)  # type: ignore
 
         return hessian
